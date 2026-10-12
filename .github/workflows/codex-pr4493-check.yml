@@ -40,6 +40,8 @@ jobs:
           components: rustfmt, clippy
       - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libssl-dev
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - run: pnpm install --frozen-lockfile
       - run: cargo fmt --all -- --check
       - run: pnpm lint-ci
