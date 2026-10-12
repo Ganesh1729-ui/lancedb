@@ -47,6 +47,19 @@ jobs:
       - run: pnpm lint-ci
       - name: Build the corrected native addon
         run: pnpm build:debug --profile ci --no-default-features --features 'remote lancedb/metrics-otel'
+      - name: Prove the original numeric dispatch fails the regressions
+        run: |
+          cp lancedb/expr.ts /tmp/pr4493-corrected-expr.ts
+          trap 'cp /tmp/pr4493-corrected-expr.ts lancedb/expr.ts' EXIT
+          git fetch origin bd443e261035f948f57ac2d72d14c74768ac9edc
+          git show bd443e261035f948f57ac2d72d14c74768ac9edc:nodejs/lancedb/expr.ts > lancedb/expr.ts
+          set +e
+          pnpm test --runInBand __test__/expr.test.ts --testNamePattern 'numeric literals|preserves an unsafe integer filter threshold' > /tmp/pr4493-numeric-before.log 2>&1
+          baseline_status=$?
+          set -e
+          cat /tmp/pr4493-numeric-before.log
+          test "$baseline_status" -ne 0
+          cp /tmp/pr4493-corrected-expr.ts lancedb/expr.ts
       - run: pnpm tsc
       - name: Focused expression and adjacent regressions
         run: pnpm test --runInBand __test__/expr.test.ts __test__/query.test.ts __test__/arrow.test.ts __test__/table.test.ts
