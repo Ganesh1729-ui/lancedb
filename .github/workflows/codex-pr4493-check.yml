@@ -1,0 +1,64 @@
+name: Validate PR 4493 corrections
+
+on:
+  push:
+    branches: [codex/validate-pr4493]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-pr4493
+  cancel-in-progress: true
+
+jobs:
+  native-node:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: 2
+      CC: gcc-12
+      CXX: g++-12
+    defaults:
+      run:
+        working-directory: nodejs
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          lfs: true
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 11.1.1
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: nodejs/pnpm-lock.yaml
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt, clippy
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libssl-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: pnpm install --frozen-lockfile
+      - run: cargo fmt --all -- --check
+      - run: pnpm lint-ci
+      - name: Build the corrected native addon
+        run: pnpm build:debug --profile ci --no-default-features --features 'remote lancedb/metrics-otel'
+      - run: pnpm tsc
+      - name: Focused expression and adjacent regressions
+        run: pnpm test --runInBand __test__/expr.test.ts __test__/query.test.ts __test__/arrow.test.ts __test__/table.test.ts
+      - name: Repeat expression tests with fresh fixtures
+        run: pnpm test --runInBand __test__/expr.test.ts
+      - name: Lint native bindings
+        run: cargo clippy --profile ci -p lancedb-nodejs --no-default-features --features remote,lancedb/metrics-otel -- -D warnings
+      - name: Generate API documentation
+        if: always()
+        run: pnpm run docs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: generated-node-api
+          path: |
+            docs/src/js
+            nodejs/lancedb/native.d.ts
