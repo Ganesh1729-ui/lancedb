@@ -77,7 +77,6 @@ use lance::dataset::{ColumnAlteration, NewColumnTransform, Version};
 use lance_datafusion::exec::{OneShotExec, execute_plan};
 use reqwest::{RequestBuilder, Response};
 use serde::{Deserialize, Serialize};
-use serde_json::Number;
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::pin::Pin;
@@ -1138,6 +1137,7 @@ impl<S: HttpSend> RemoteTable<S> {
         mut body: serde_json::Value,
         query: &VectorQueryRequest,
     ) -> Result<Vec<serde_json::Value>> {
+        query.validate_search_effort()?;
         self.apply_query_params(&mut body, &query.base)?;
 
         // Apply general parameters, before we dispatch based on number of query vectors.
@@ -1147,17 +1147,17 @@ impl<S: HttpSend> RemoteTable<S> {
         if let Some(approx_mode) = query.approx_mode {
             body["approx_mode"] = serde_json::json!(approx_mode);
         }
-        // In 0.23.1 we migrated from `nprobes` to `minimum_nprobes` and `maximum_nprobes`.
-        // Old client / new server: since minimum_nprobes is missing, fallback to nprobes
-        // New client / old server: old server will only see nprobes, make sure to set both
-        //                          nprobes and minimum_nprobes
-        // New client / new server: since minimum_nprobes is present, server can ignore nprobes
-        body["nprobes"] = query.minimum_nprobes.into();
-        body["minimum_nprobes"] = query.minimum_nprobes.into();
+        if let Some(nprobes) = query.nprobes {
+            body["nprobes"] = nprobes.into();
+        }
+        if let Some(minimum_nprobes) = query.minimum_nprobes {
+            body["minimum_nprobes"] = minimum_nprobes.into();
+        }
         if let Some(maximum_nprobes) = query.maximum_nprobes {
             body["maximum_nprobes"] = maximum_nprobes.into();
-        } else {
-            body["maximum_nprobes"] = serde_json::Value::Number(Number::from_u128(0).unwrap())
+        }
+        if let Some(search_effort) = query.search_effort {
+            body["search_effort"] = search_effort.into();
         }
         body["lower_bound"] = query.lower_bound.into();
         body["upper_bound"] = query.upper_bound.into();
@@ -6090,9 +6090,6 @@ mod tests {
             let body: serde_json::Value = serde_json::from_slice(body).unwrap();
             let mut expected_body = serde_json::json!({
                 "prefilter": true,
-                "nprobes": 20,
-                "minimum_nprobes": 20,
-                "maximum_nprobes": 20,
                 "lower_bound": Option::<f32>::None,
                 "upper_bound": Option::<f32>::None,
                 "k": 10,
@@ -6124,7 +6121,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_query_vector_approx_mode_sent_when_set() {
+    async fn test_query_vector_minimum_only_and_approx_mode() {
         let expected_data = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)])),
             vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
@@ -6144,9 +6141,7 @@ mod tests {
             let body: serde_json::Value = serde_json::from_slice(body).unwrap();
             let mut expected_body = serde_json::json!({
                 "prefilter": true,
-                "nprobes": 20,
-                "minimum_nprobes": 20,
-                "maximum_nprobes": 20,
+                "minimum_nprobes": 5,
                 "approx_mode": "accurate",
                 "lower_bound": Option::<f32>::None,
                 "upper_bound": Option::<f32>::None,
@@ -6170,12 +6165,47 @@ mod tests {
             .query()
             .nearest_to(vec![0.1, 0.2, 0.3])
             .unwrap()
+            .minimum_nprobes(5)
+            .unwrap()
             .approx_mode(crate::ApproxMode::Accurate)
             .execute()
             .await;
         let data = data.unwrap().collect::<Vec<_>>().await;
         assert_eq!(data.len(), 1);
         assert_eq!(data[0].as_ref().unwrap(), &expected_data);
+    }
+
+    #[tokio::test]
+    async fn test_query_vector_explicitly_unbounded_maximum() {
+        let table = Table::new_with_handler("my_table", |request| {
+            let body = request.body().unwrap().as_bytes().unwrap();
+            let body: serde_json::Value = serde_json::from_slice(body).unwrap();
+            assert_eq!(body["nprobes"], 5);
+            assert_eq!(body["maximum_nprobes"], 0);
+
+            let data = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)])),
+                vec![Arc::new(Int32Array::from(vec![1]))],
+            )
+            .unwrap();
+            http::Response::builder()
+                .status(200)
+                .header(CONTENT_TYPE, ARROW_FILE_CONTENT_TYPE)
+                .body(write_ipc_file(&data))
+                .unwrap()
+        });
+
+        table
+            .query()
+            .nearest_to(vec![0.1, 0.2, 0.3])
+            .unwrap()
+            .nprobes(5)
+            .unwrap()
+            .maximum_nprobes(None)
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -6243,6 +6273,77 @@ mod tests {
         ));
     }
 
+    #[rstest]
+    #[case::unset(None)]
+    #[case::minimum(Some(0.0))]
+    #[case::low(Some(0.25))]
+    #[case::auto(Some(0.5))]
+    #[case::high(Some(0.75))]
+    #[case::maximum(Some(1.0))]
+    #[tokio::test]
+    async fn test_query_vector_search_effort_wire(#[case] effort: Option<f64>) {
+        let table = Table::new_with_handler("my_table", move |request| {
+            let body = request_body_json(&request);
+            assert_eq!(body["nprobes"], 7);
+            assert_eq!(body["minimum_nprobes"], 2);
+            assert_eq!(body["maximum_nprobes"], 8);
+            if let Some(effort) = effort {
+                assert_eq!(body["search_effort"], effort);
+            } else {
+                assert!(body.get("search_effort").is_none());
+            }
+            let batch = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+                vec![Arc::new(Int32Array::from(vec![1]))],
+            )
+            .unwrap();
+            http::Response::builder()
+                .status(200)
+                .header(CONTENT_TYPE, ARROW_FILE_CONTENT_TYPE)
+                .body(write_ipc_file(&batch))
+                .unwrap()
+        });
+        let batches = table
+            .query()
+            .nearest_to(vec![0.1, 0.2])
+            .unwrap()
+            .search_effort(effort)
+            .unwrap()
+            .nprobes(7)
+            .unwrap()
+            .minimum_nprobes(2)
+            .unwrap()
+            .maximum_nprobes(Some(8))
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(batches[0].num_rows(), 1);
+    }
+
+    #[rstest]
+    #[case::negative(-0.1)]
+    #[case::too_large(1.1)]
+    #[case::nan(f64::NAN)]
+    #[case::infinity(f64::INFINITY)]
+    #[case::negative_infinity(f64::NEG_INFINITY)]
+    #[tokio::test]
+    async fn test_query_vector_search_effort_invalid(#[case] effort: f64) {
+        let table = Table::new_with_handler::<&str>("my_table", |_| {
+            panic!("invalid search_effort must not send a request")
+        });
+        let result = table
+            .query()
+            .nearest_to(vec![0.1, 0.2])
+            .unwrap()
+            .search_effort(effort);
+        assert!(matches!(result, Err(Error::InvalidInput { message })
+            if message.contains("search_effort must be finite and in [0, 1]")));
+    }
+
     #[tokio::test]
     async fn test_query_vector_all_params() {
         let table = Table::new_with_handler("my_table", |request| {
@@ -6276,8 +6377,8 @@ mod tests {
                     }
                 ],
                 "nprobes": 12,
-                "minimum_nprobes": 12,
-                "maximum_nprobes": 12,
+                "minimum_nprobes": 3,
+                "maximum_nprobes": 10,
                 "lower_bound": Option::<f32>::None,
                 "upper_bound": Option::<f32>::None,
                 "ef": Option::<usize>::None,
@@ -6317,6 +6418,10 @@ mod tests {
             .distance_type(crate::DistanceType::Cosine)
             .nprobes(12)
             .unwrap()
+            .minimum_nprobes(3)
+            .unwrap()
+            .maximum_nprobes(Some(10))
+            .unwrap()
             .refine_factor(2)
             .bypass_vector_index()
             .execute()
@@ -6347,9 +6452,6 @@ mod tests {
                 "vector_column": "image.embedding",
                 "prefilter": true,
                 "k": 10,
-                "nprobes": 20,
-                "minimum_nprobes": 20,
-                "maximum_nprobes": 20,
                 "lower_bound": Option::<f32>::None,
                 "upper_bound": Option::<f32>::None,
                 "ef": Option::<usize>::None,
