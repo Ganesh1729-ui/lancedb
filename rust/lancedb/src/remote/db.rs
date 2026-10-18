@@ -1579,25 +1579,32 @@ impl<S: HttpSend> Database for RemoteDatabase<S> {
             // the table still exists before returning a handle for it.
             let req = self
                 .client
-                .post(&format!("/v1/table/{}/describe/", identifier));
+                .post(&format!("/v1/table/{}/describe/", identifier))
+                .json(&serde_json::json!({}));
             let (request_id, rsp) = self.client.send_with_retry(req, None, true).await?;
             let rsp =
                 RemoteTable::<S>::handle_table_not_found(&request.name, rsp, &request_id).await?;
-            self.client.check_response(&request_id, rsp).await?;
+            let rsp = self.client.check_response(&request_id, rsp).await?;
+            let describe_body = rsp.text().await.ok();
 
-            Ok(Arc::new(RemoteTable::new_with_sql_client(
+            let table = Arc::new(RemoteTable::new_with_sql_client(
                 self.client.clone(),
                 request.name,
                 request.namespace_path,
                 identifier,
                 version,
                 self.sql_client.clone(),
-            )))
+            ));
+            if let Some(body) = &describe_body {
+                table.seed_schema(body);
+            }
+            Ok(table)
         } else {
             // Describe the table to confirm it exists before moving on.
             let req = self
                 .client
-                .post(&format!("/v1/table/{}/describe/", identifier));
+                .post(&format!("/v1/table/{}/describe/", identifier))
+                .json(&serde_json::json!({}));
             let (request_id, rsp) = self.client.send_with_retry(req, None, true).await?;
             let rsp =
                 RemoteTable::<S>::handle_table_not_found(&request.name, rsp, &request_id).await?;
@@ -2574,12 +2581,20 @@ mod tests {
         assert_eq!(reader.version().await.unwrap(), 1);
     }
 
+    #[rstest::rstest]
+    #[case(false)]
+    #[case(true)]
     #[tokio::test]
-    async fn test_open_table_seeds_the_schema_from_its_describe() {
+    async fn test_open_table_seeds_the_schema_from_its_describe(#[case] cached: bool) {
         let describe_calls = Arc::new(AtomicUsize::new(0));
         let counted = describe_calls.clone();
-        let conn = Connection::new_with_handler(move |request| {
+        let mut db = super::RemoteDatabase::new_mock(move |request| {
             assert_eq!(request.url().path(), "/v1/table/table1/describe/");
+            assert_eq!(
+                request.headers()[reqwest::header::CONTENT_TYPE],
+                JSON_CONTENT_TYPE
+            );
+            assert_eq!(request.body().unwrap().as_bytes().unwrap(), b"{}");
             counted.fetch_add(1, Ordering::SeqCst);
             http::Response::builder()
                 .status(200)
@@ -2591,27 +2606,44 @@ mod tests {
                 )
                 .unwrap()
         });
+        db.table_cache = moka::future::Cache::new(10);
+        let conn = Connection::new(
+            Arc::new(db),
+            Arc::new(crate::embeddings::MemoryRegistry::new()),
+        );
+        if cached {
+            conn.open_table("table1").execute().await.unwrap();
+        }
 
         let table = conn.open_table("table1").execute().await.unwrap();
         let schema = table.schema().await.unwrap();
 
         assert_eq!(schema.field(0).name(), "id");
-        assert_eq!(describe_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            describe_calls.load(Ordering::SeqCst),
+            1 + usize::from(cached)
+        );
     }
 
     #[tokio::test]
     async fn test_open_table_survives_a_describe_body_it_cannot_parse() {
-        let conn = Connection::new_with_handler(|request| {
+        let mut db = super::RemoteDatabase::new_mock(|request| {
             assert_eq!(request.url().path(), "/v1/table/table1/describe/");
             http::Response::builder()
                 .status(200)
                 .body(r#"{"table": "table1"}"#.to_string())
                 .unwrap()
         });
+        db.table_cache = moka::future::Cache::new(10);
+        let conn = Connection::new(
+            Arc::new(db),
+            Arc::new(crate::embeddings::MemoryRegistry::new()),
+        );
 
-        let table = conn.open_table("table1").execute().await.unwrap();
-
-        assert_eq!(table.name(), "table1");
+        for _ in 0..2 {
+            let table = conn.open_table("table1").execute().await.unwrap();
+            assert_eq!(table.name(), "table1");
+        }
     }
 
     #[tokio::test]
@@ -3669,6 +3701,43 @@ mod tests {
                 opened_table.err()
             );
             assert_eq!(opened_table.unwrap().name(), "test_table");
+
+            // A second connection must also be able to open without a cached entry.
+            let other = ConnectBuilder::new("db://dummy")
+                .api_key("test-api-key")
+                .region("us-east-1")
+                .host_override(&fixture.server_url)
+                .execute()
+                .await
+                .unwrap();
+            other
+                .open_table("test_table")
+                .namespace(namespace.clone())
+                .execute()
+                .await
+                .unwrap();
+
+            // Dropping through another client leaves this connection's cache stale.
+            let mut table_id = namespace.clone();
+            table_id.push("test_table".to_string());
+            other
+                .namespace_client()
+                .await
+                .unwrap()
+                .drop_table(lance_namespace::models::DropTableRequest {
+                    id: Some(table_id),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let result = conn
+                .open_table("test_table")
+                .namespace(namespace)
+                .execute()
+                .await;
+            assert!(
+                matches!(result, Err(Error::TableNotFound { name, .. }) if name == "test_table")
+            );
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
