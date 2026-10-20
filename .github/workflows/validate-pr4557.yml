@@ -1,0 +1,100 @@
+name: Validate cached remote table opening
+
+on:
+  push:
+    branches: [codex/validate-pr4557-20261020]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-pr4557-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cached-open-regressions:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_BUILD_JOBS: "2"
+      RUST_BACKTRACE: "1"
+      CC: clang-18
+      CXX: clang++-18
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          lfs: true
+      - name: Verify exact PR runtime and test sources
+        run: |
+          git diff --exit-code d39092b01f6b49921b5d66ccedf29709a7ddc23d -- rust nodejs python Cargo.toml Cargo.lock rust-toolchain.toml
+          git log -1 --format='%H %s'
+          df -h .
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: pr4557-remote-ci
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libssl-dev
+      - uses: rui314/setup-mold@v1
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+      - name: Run current-head open-table regressions
+        run: |
+          cargo test --profile ci --locked -p lancedb --features remote --lib remote::db::tests::test_open_table -- --nocapture 2>&1 | tee /tmp/pr4557-open-table.log
+          python - <<'PY'
+          from pathlib import Path
+          log = Path('/tmp/pr4557-open-table.log').read_text()
+          assert 'test_open_table_checks_that_a_cached_table_still_exists' in log
+          assert 'test result: ok.' in log
+          PY
+      - name: Reproduce the original cached-hit defect
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('rust/lancedb/src/remote/db.rs')
+          source = path.read_text()
+          marker = '            // A cached version can outlive a drop from another connection.'
+          assert source.count(marker) == 1
+          start = source.index(marker)
+          end = source.index('            Ok(Arc::new(RemoteTable::new_with_sql_client(', start)
+          path.write_text(source[:start] + source[end:])
+          PY
+          set +e
+          cargo test --profile ci --locked -p lancedb --features remote --lib remote::db::tests::test_open_table_checks_that_a_cached_table_still_exists -- --exact --nocapture > /tmp/pr4557-before.log 2>&1
+          baseline_status=$?
+          set -e
+          cat /tmp/pr4557-before.log
+          python - "$baseline_status" <<'PY'
+          import sys
+          from pathlib import Path
+          log = Path('/tmp/pr4557-before.log').read_text()
+          assert int(sys.argv[1]) != 0, 'The regression did not catch the removed existence check'
+          assert 'test result: FAILED. 0 passed; 1 failed' in log, log
+          assert 'assertion failed:' in log and 'TableNotFound' in log, log
+          PY
+      - name: Restore and repeat the fixed regression
+        run: |
+          git restore --source=HEAD -- rust/lancedb/src/remote/db.rs
+          git diff --exit-code -- rust/lancedb/src/remote/db.rs
+          cargo test --profile ci --locked -p lancedb --features remote --lib remote::db::tests::test_open_table_checks_that_a_cached_table_still_exists -- --exact --nocapture 2>&1 | tee /tmp/pr4557-after.log
+          python - <<'PY'
+          from pathlib import Path
+          log = Path('/tmp/pr4557-after.log').read_text()
+          assert 'test result: ok. 1 passed; 0 failed' in log, log
+          PY
+      - name: Save validation logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pr4557-open-table-regressions
+          path: /tmp/pr4557-*.log
+          if-no-files-found: ignore
